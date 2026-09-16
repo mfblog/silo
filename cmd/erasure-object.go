@@ -135,7 +135,7 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 
 	if dstOpts.ReplicaLockReconcile {
 		reconcileStoredObjectLock(srcInfo.UserDefined, storedObjectLockState(fi.Metadata))
-		reconcileStoredObjectTags(srcInfo.UserDefined, fi.Metadata)
+		reconcileStoredObjectTags(srcInfo.UserDefined, fi.Metadata[xhttp.AmzObjectTagging], fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp])
 	}
 
 	filterOnlineDisksInplace(fi, metaArr, onlineDisks)
@@ -1311,7 +1311,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		// existing version contributes independently ordered lock and tags.
 		if opts.ReplicaLockReconcile && err == nil {
 			reconcileStoredObjectLock(opts.UserDefined, storedObjectLockState(obj.UserDefined))
-			reconcileStoredObjectTags(opts.UserDefined, obj.UserDefined)
+			reconcileStoredObjectTags(opts.UserDefined, obj.UserTags, obj.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp])
 		}
 	}
 
@@ -2327,7 +2327,11 @@ func (er erasureObjects) PutObjectTags(ctx context.Context, bucket, object strin
 
 	fi.Metadata[xhttp.AmzObjectTagging] = tags
 	fi.ReplicationState = opts.PutReplicationState()
+	stamp := monotonicTaggingTimestamp(opts.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp], fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp])
 	maps.Copy(fi.Metadata, opts.UserDefined)
+	if stamp != "" {
+		fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp] = stamp
+	}
 
 	if err = er.updateObjectMeta(ctx, bucket, object, fi, onlineDisks); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)

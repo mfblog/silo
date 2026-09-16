@@ -126,10 +126,9 @@ func mergedPoolObjectInfo(copies []PoolObjInfo) ObjectInfo {
 		stamp, _ := time.Parse(time.RFC3339Nano, ts)
 		if olderThan(oi.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp], stamp) {
 			oi.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = ts
-			oi.UserDefined[xhttp.AmzObjectTagging] = copy.ObjInfo.UserDefined[xhttp.AmzObjectTagging]
+			oi.UserTags = copy.ObjInfo.UserTags
 		}
 	}
-	oi.UserTags = oi.UserDefined[xhttp.AmzObjectTagging]
 	return oi
 }
 
@@ -190,6 +189,12 @@ func (z *erasureServerPools) updatePoolMetadata(ctx context.Context, bucket, obj
 			changes[key] = ""
 		}
 	}
+	// Metadata callbacks may explicitly replace tags in the raw write map.
+	// Otherwise retain the merged value from the ObjectInfo read model.
+	tags, ok := updated.UserDefined[xhttp.AmzObjectTagging]
+	if !ok {
+		tags = updated.UserTags
+	}
 	state := storedObjectLockState(updated.UserDefined)
 	opts.VersionID = updated.VersionID
 	if opts.VersionID == "" {
@@ -199,11 +204,13 @@ func (z *erasureServerPools) updatePoolMetadata(ctx context.Context, bucket, obj
 	opts.EvalMetadataFn = func(oi *ObjectInfo, _ error) (ReplicateDecision, error) {
 		maps.Copy(oi.UserDefined, changes)
 		replaceObjectLockMetadata(oi.UserDefined, state)
-		for _, key := range []string{xhttp.AmzObjectTagging, ReservedMetadataPrefixLower + TaggingTimestamp} {
-			value, exists := updated.UserDefined[key]
-			if exists || oi.UserDefined[key] != "" {
-				oi.UserDefined[key] = value
-			}
+		// Reassemble the tag value and its ordering timestamp for storage.
+		if tags != "" || oi.UserTags != "" {
+			oi.UserDefined[xhttp.AmzObjectTagging] = tags
+		}
+		key := ReservedMetadataPrefixLower + TaggingTimestamp
+		if value, exists := updated.UserDefined[key]; exists || oi.UserDefined[key] != "" {
+			oi.UserDefined[key] = value
 		}
 		return ReplicateDecision{}, nil
 	}
@@ -220,17 +227,34 @@ func (z *erasureServerPools) updatePoolMetadata(ctx context.Context, bucket, obj
 	return primary, nil
 }
 
-func reconcileStoredObjectTags(metadata, stored map[string]string) {
+// Pass the stored tag value explicitly: ObjectInfo.UserDefined excludes it,
+// whereas FileInfo.Metadata retains the raw storage key.
+func reconcileStoredObjectTags(metadata map[string]string, storedTags, storedTimestamp string) {
 	key := ReservedMetadataPrefixLower + TaggingTimestamp
-	stamp, err := time.Parse(time.RFC3339Nano, stored[key])
+	stamp, err := time.Parse(time.RFC3339Nano, storedTimestamp)
 	if err != nil {
 		return
 	}
 	incoming, err := time.Parse(time.RFC3339Nano, metadata[key])
 	if err != nil || !stamp.Before(incoming) {
-		metadata[key] = stored[key]
-		metadata[xhttp.AmzObjectTagging] = stored[xhttp.AmzObjectTagging]
+		metadata[key] = storedTimestamp
+		metadata[xhttp.AmzObjectTagging] = storedTags
 	}
+}
+
+// Local tagging mutations must advance the revision they overwrite, even when
+// a request's clock or lock acquisition order is behind the stored revision.
+// Replica writes use reconcileStoredObjectTags instead of minting a revision.
+func monotonicTaggingTimestamp(incoming, stored string) string {
+	requested, err := time.Parse(time.RFC3339Nano, incoming)
+	if err != nil {
+		return incoming
+	}
+	current, err := time.Parse(time.RFC3339Nano, stored)
+	if err != nil || requested.After(current) {
+		return incoming
+	}
+	return current.Add(time.Nanosecond).UTC().Format(time.RFC3339Nano)
 }
 
 // A restored version still owns its tier reference even while IsRemote is
@@ -287,33 +311,51 @@ func (z *erasureServerPools) retireReplicaCopies(ctx context.Context, bucket, ob
 	return nil
 }
 
-// deleteObjectConditional evaluates the condition once against the logical
+// deleteObjectReconciled evaluates any condition once against the logical
 // version, then removes all its copies under the same lock as pooled writers.
-func (z *erasureServerPools) deleteObjectConditional(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+func (z *erasureServerPools) deleteObjectReconciled(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
 	copies, err := z.objectPoolInfos(ctx, bucket, object, opts)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
 	primary := copies[0]
-	if opts.CheckPrecondFn(primary.ObjInfo) {
+	if opts.CheckPrecondFn != nil && opts.CheckPrecondFn(primary.ObjInfo) {
 		return ObjectInfo{}, PreConditionFailed{}
 	}
 	opts.CheckPrecondFn = nil
 	opts.NoLock = true
 	if opts.EvalRetentionBypassFn != nil || opts.EvalMetadataFn != nil {
-		versions, err := z.metadataPoolInfos(ctx, bucket, object, opts)
-		if err != nil {
-			return ObjectInfo{}, err
+		logical := primary.ObjInfo
+		var gerr error
+		switch {
+		case logical.DeleteMarker:
+			// Markers can be deleted by version ID. Match the set layer's
+			// callback inputs instead of rejecting them as metadata updates.
+			gerr = toObjectErr(errMethodNotAllowed, bucket, object)
+			if opts.VersionID == "" || opts.DeleteMarker {
+				gerr = toObjectErr(errFileNotFound, bucket, object)
+			}
+		case opts.VersionID != "":
+			// An addressed version already resolved every copy above.
+			logical = mergedPoolObjectInfo(copies)
+		default:
+			versions, err := z.metadataPoolInfos(ctx, bucket, object, opts)
+			if err != nil {
+				return ObjectInfo{}, err
+			}
+			logical = mergedPoolObjectInfo(versions)
 		}
-		logical := mergedPoolObjectInfo(versions)
+		// Keep the retention gate first. These callbacks independently evaluate
+		// the logical version and run once before any deletion; the handler only
+		// sweeps metadata's transition state after a successful delete.
 		if opts.EvalRetentionBypassFn != nil {
-			if err := opts.EvalRetentionBypassFn(logical, nil); err != nil {
+			if err := opts.EvalRetentionBypassFn(logical, gerr); err != nil {
 				return ObjectInfo{}, err
 			}
 			opts.EvalRetentionBypassFn = nil
 		}
 		if opts.EvalMetadataFn != nil {
-			decision, err := opts.EvalMetadataFn(&logical, nil)
+			decision, err := opts.EvalMetadataFn(&logical, gerr)
 			if err != nil {
 				return ObjectInfo{}, err
 			}
